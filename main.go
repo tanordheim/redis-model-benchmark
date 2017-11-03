@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ const numberOfItems = 100000
 const appendVsPrependPct = 30
 const blobSize = 1000
 const itemsToRemoveByKey = 100
+const numberOfRetrievals = 25
 
 func main() {
 	client := redis.NewClient(&redis.Options{
@@ -21,10 +23,17 @@ func main() {
 	})
 
 	cleanup(client)
+	ts := time.Now().UnixNano()
 
-	runAppendAndPrependBenchmark(client)
+	runAppendAndPrependBenchmark(ts, client)
+	fmt.Printf("\n")
+	runRetrieveAllBenchmark(client)
+	fmt.Printf("\n")
+	runRetrieveAfterTimestampBenchmark(ts, client)
 	fmt.Printf("\n")
 	runRemoveByCoalesceKeyBenchmark(client)
+	fmt.Printf("\n")
+	runTerminateBenchmark(client)
 }
 
 func cleanup(client *redis.Client) {
@@ -37,12 +46,10 @@ func buildRandomBlob(size int64) []byte {
 	return blob
 }
 
-func runAppendAndPrependBenchmark(client *redis.Client) {
+func runAppendAndPrependBenchmark(ts int64, client *redis.Client) {
 	fmt.Printf("Running append/prepend benchmark by inserting %d items (%d byte blobs), %d%% prepends\n", numberOfItems, blobSize, appendVsPrependPct)
 
 	start := time.Now()
-	ts := time.Now().UnixNano()
-
 	for i := 0; i < numberOfItems; i++ {
 		coalesceKey := fmt.Sprintf("coalesce_%d", i)
 		coalesceKeyName := fmt.Sprintf("%s:coalesce:%s", keyBaseName, coalesceKey)
@@ -68,6 +75,53 @@ func runAppendAndPrependBenchmark(client *redis.Client) {
 
 	elapsed := time.Since(start)
 	fmt.Printf("Appending/prepending %d items took %s, average duration was %s\n", numberOfItems, elapsed, elapsed/numberOfItems)
+}
+
+func runRetrieveAllBenchmark(client *redis.Client) {
+	fmt.Printf("Running %d retrievals of all %d items\n", numberOfRetrievals, numberOfItems)
+	start := time.Now()
+	prependKey := fmt.Sprintf("%s:prepend", keyBaseName)
+	appendKey := fmt.Sprintf("%s:append", keyBaseName)
+
+	for i := 0; i < numberOfRetrievals; i++ {
+		prep, err := client.ZRevRangeByScore(prependKey, redis.ZRangeBy{Min: "-inf", Max: "+inf"}).Result()
+		if err != nil {
+			panic(err)
+		}
+		app, err := client.ZRangeByScore(appendKey, redis.ZRangeBy{Min: "-inf", Max: "+inf"}).Result()
+		if err != nil {
+			panic(err)
+		}
+		_ = append(prep, app...)
+	}
+
+	elapsed := time.Since(start)
+	fmt.Printf("Retrieving all %d items took %s for %d iterations, average duration was %s\n", numberOfItems, elapsed, numberOfRetrievals, elapsed/numberOfRetrievals)
+}
+
+func runRetrieveAfterTimestampBenchmark(ts int64, client *redis.Client) {
+	// Add some time to the timestamp to have a smaller window to query
+	ts = ts + ((numberOfItems / 2) * 10000)
+
+	fmt.Printf("Running %d retrievals of items after timestamp %d\n", numberOfRetrievals, ts)
+	start := time.Now()
+	prependKey := fmt.Sprintf("%s:prepend", keyBaseName)
+	appendKey := fmt.Sprintf("%s:append", keyBaseName)
+
+	for i := 0; i < numberOfRetrievals; i++ {
+		prep, err := client.ZRevRangeByScore(prependKey, redis.ZRangeBy{Min: strconv.FormatInt(ts, 10), Max: "+inf"}).Result()
+		if err != nil {
+			panic(err)
+		}
+		app, err := client.ZRangeByScore(appendKey, redis.ZRangeBy{Min: strconv.FormatInt(ts, 10), Max: "+inf"}).Result()
+		if err != nil {
+			panic(err)
+		}
+		_ = append(prep, app...)
+	}
+
+	elapsed := time.Since(start)
+	fmt.Printf("Retrieving items after timestamp %d took %s for %d iterations, average duration was %s\n", ts, elapsed, numberOfRetrievals, elapsed/numberOfRetrievals)
 }
 
 func runRemoveByCoalesceKeyBenchmark(client *redis.Client) {
@@ -112,4 +166,35 @@ func runRemoveByCoalesceKeyBenchmark(client *redis.Client) {
 	if appCount+prepCount != int64(currentCount) {
 		fmt.Printf("WARN: Expected %d items to be left, got %d (%d append and %d prepend)\n", currentCount, appCount+prepCount, appCount, prepCount)
 	}
+}
+
+func runTerminateBenchmark(client *redis.Client) {
+	fmt.Printf("Running termination benchmark of all %d items\n", numberOfItems)
+	prependKey := fmt.Sprintf("%s:prepend", keyBaseName)
+	appendKey := fmt.Sprintf("%s:append", keyBaseName)
+	start := time.Now()
+
+	// Delete sorted sets
+	_, err := client.Del(prependKey, appendKey).Result()
+	if err != nil {
+		panic(err)
+	}
+
+	// Delete coalesce maps
+	var cursor uint64
+	for {
+		var keys []string
+		var err error
+		keys, cursor, err = client.Scan(cursor, fmt.Sprintf("%s:coalesce:*", keyBaseName), 1000).Result()
+		if err != nil {
+			panic(err)
+		}
+		client.Del(keys...)
+		if cursor == 0 {
+			break
+		}
+	}
+
+	elapsed := time.Since(start)
+	fmt.Printf("Termination of all %d items took %s\n", numberOfItems, elapsed)
 }
