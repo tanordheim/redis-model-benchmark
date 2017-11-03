@@ -1,0 +1,4 @@
+package: scratch/redis-live-update-benchmark
+import:
+- package: github.com/go-redis/redis
+  version: v6.7.3

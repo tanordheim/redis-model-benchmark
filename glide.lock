@@ -1,0 +1,8 @@
+hash: a1694d7921c5d2950042a02f2f7513eddeba6216432bb94922229c728a90a2ad
+updated: 2017-11-03T10:30:58.762591753+01:00
+imports:
+- name: github.com/alphazero/Go-Redis
+  version: a0637b1543645181061469efea75f57ad2e3f23a
+- name: github.com/go-redis/redis
+  version: d0f86971b5d61de9cebd2616b932acb7ba14d957
+testImports: []
