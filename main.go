@@ -3,13 +3,17 @@ package main
 import (
 	"fmt"
 	"math/rand"
-	"sync"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis"
 )
 
-const insertTestKey = "benchmark:insert"
+const keyBaseName = "benchmark"
+const numberOfItems = 100000
+const appendVsPrependPct = 30
+const blobSize = 1000
+const itemsToRemoveByKey = 100
 
 func main() {
 	client := redis.NewClient(&redis.Options{
@@ -17,25 +21,14 @@ func main() {
 	})
 
 	cleanup(client)
-	runInsertBenchmark(client)
+
+	runAppendAndPrependBenchmark(client)
+	fmt.Printf("\n")
+	runRemoveByCoalesceKeyBenchmark(client)
 }
 
 func cleanup(client *redis.Client) {
-	for _, k := range []string{insertTestKey} {
-		var cursor uint64
-		for {
-			var keys []string
-			var err error
-			keys, cursor, err = client.Scan(cursor, fmt.Sprintf("%s:*", k), 1000).Result()
-			if err != nil {
-				panic(err)
-			}
-			client.Del(keys...)
-			if cursor == 0 {
-				break
-			}
-		}
-	}
+	client.FlushDb()
 }
 
 func buildRandomBlob(size int64) []byte {
@@ -44,49 +37,79 @@ func buildRandomBlob(size int64) []byte {
 	return blob
 }
 
-func runInsertBenchmark(client *redis.Client) {
-	const numberOfItems = 100000
-	const appendVsPrependPct = 30
-	const blobSize = 1000
-	fmt.Printf("Running insert benchmark by inserting %d items (%d byte blobs), %d%% prepend\n", numberOfItems, blobSize, appendVsPrependPct)
-
-	var wg sync.WaitGroup
-	wg.Add(numberOfItems)
+func runAppendAndPrependBenchmark(client *redis.Client) {
+	fmt.Printf("Running append/prepend benchmark by inserting %d items (%d byte blobs), %d%% prepends\n", numberOfItems, blobSize, appendVsPrependPct)
 
 	start := time.Now()
 	ts := time.Now().UnixNano()
+
 	for i := 0; i < numberOfItems; i++ {
-		metaKey := fmt.Sprintf("%s:meta", insertTestKey)
-		blobKey := fmt.Sprintf("%s:payload:%d", insertTestKey, ts)
-		payload := []byte(fmt.Sprintf("%d %s", ts, fmt.Sprintf("coalesce_%d", i)))
+		coalesceKey := fmt.Sprintf("coalesce_%d", i)
+		coalesceKeyName := fmt.Sprintf("%s:coalesce:%s", keyBaseName, coalesceKey)
+		payload := buildRandomBlob(blobSize)
 		isPrepend := i%100 < appendVsPrependPct
+		setSuffix := "append"
+		if isPrepend {
+			setSuffix = "prepend"
+		}
+		setName := fmt.Sprintf("%s:%s", keyBaseName, setSuffix)
 
-		go func() {
-			defer wg.Done()
+		_, err := client.ZAdd(setName, redis.Z{float64(ts), payload}).Result()
+		if err != nil {
+			panic(err)
+		}
 
-			// Append/prepend the metadata
-			if isPrepend {
-				if err := client.LPush(metaKey, payload).Err(); err != nil {
-					panic(err)
-				}
-			} else {
-				if err := client.RPush(metaKey, payload).Err(); err != nil {
-					panic(err)
-				}
-			}
-
-			// Insert the binary data
-			if err := client.Set(blobKey, buildRandomBlob(blobSize), 0).Err(); err != nil {
-				fmt.Printf("blob err: %v\n", err)
-				panic(err)
-			}
-
-		}()
-
-		ts += 100
+		_, err = client.Set(coalesceKeyName, fmt.Sprintf("%s:%d", setSuffix, ts), 0).Result()
+		if err != nil {
+			panic(err)
+		}
+		ts += 10000
 	}
 
-	wg.Wait()
 	elapsed := time.Since(start)
-	fmt.Printf("Inserting %d items took %s\n", numberOfItems, elapsed)
+	fmt.Printf("Appending/prepending %d items took %s, average duration was %s\n", numberOfItems, elapsed, elapsed/numberOfItems)
+}
+
+func runRemoveByCoalesceKeyBenchmark(client *redis.Client) {
+	fmt.Printf("Running remove by coalesce key benchmark by removing %d items in random locations\n", itemsToRemoveByKey)
+	start := time.Now()
+	currentCount := numberOfItems
+
+	for i := 0; i < itemsToRemoveByKey; i++ {
+		removeIdx := rand.Intn(currentCount)
+		coalesceKeyName := fmt.Sprintf("%s:coalesce:coalesce_%d", keyBaseName, removeIdx)
+
+		val, err := client.Get(coalesceKeyName).Result()
+		if err != nil {
+			panic(err)
+		}
+
+		parts := strings.Split(val, ":")
+		setName := fmt.Sprintf("%s:%s", keyBaseName, parts[0])
+		rangeVal := parts[1]
+		removed, err := client.ZRemRangeByScore(setName, rangeVal, rangeVal).Result()
+		if err != nil {
+			panic(err)
+		}
+		if removed != 1 {
+			fmt.Printf("WARN: Expected 1 item to be removed with range %s from %s, got %d\n", rangeVal, setName, removed)
+		}
+
+		currentCount--
+	}
+
+	elapsed := time.Since(start)
+	fmt.Printf("Removing %d items by coalesce key took %s, average duration was %s\n", itemsToRemoveByKey, elapsed, elapsed/itemsToRemoveByKey)
+
+	appCount, err := client.ZCount(fmt.Sprintf("%s:append", keyBaseName), "-inf", "+inf").Result()
+	if err != nil {
+		panic(err)
+	}
+	prepCount, err := client.ZCount(fmt.Sprintf("%s:prepend", keyBaseName), "-inf", "+inf").Result()
+	if err != nil {
+		panic(err)
+	}
+	if appCount+prepCount != int64(currentCount) {
+		fmt.Printf("WARN: Expected %d items to be left, got %d (%d append and %d prepend)\n", currentCount, appCount+prepCount, appCount, prepCount)
+	}
 }
